@@ -1,19 +1,79 @@
 # Bonito
 
 [![PyPI version](https://badge.fury.io/py/ont-bonito.svg)](https://badge.fury.io/py/ont-bonito)
+[![py37](https://img.shields.io/badge/python-3.7-brightgreen.svg)](https://img.shields.io/badge/python-3.7-brightgreen.svg)
+[![py38](https://img.shields.io/badge/python-3.8-brightgreen.svg)](https://img.shields.io/badge/python-3.8-brightgreen.svg)
+[![py39](https://img.shields.io/badge/python-3.9-brightgreen.svg)](https://img.shields.io/badge/python-3.9-brightgreen.svg)
+[![cu102](https://img.shields.io/badge/cuda-10.2-blue.svg)](https://img.shields.io/badge/cuda-10.2-blue.svg)
+[![cu111](https://img.shields.io/badge/cuda-11.1-blue.svg)](https://img.shields.io/badge/cuda-11.1-blue.svg)
+[![cu113](https://img.shields.io/badge/cuda-11.3-blue.svg)](https://img.shields.io/badge/cuda-11.3-blue.svg)
 
 A PyTorch Basecaller for Oxford Nanopore Reads.
 
 ```bash
+$ pip install --upgrade pip
 $ pip install ont-bonito
-$ bonito basecaller dna_r9.4.1 /data/reads > basecalls.fasta
+$ bonito basecaller dna_r10.4_e8.1_sup@v3.4 /data/reads > basecalls.bam
 ```
 
-If a reference is provided in either `.fasta` or `.mmi` format then bonito will output in `sam` format.
+Bonito supports writing aligned/unaligned `{fastq, sam, bam, cram}`.
 
 ```bash
-$ bonito basecaller dna_r9.4.1 --reference reference.mmi /data/reads > basecalls.sam
+$ bonito basecaller dna_r10.4_e8.1_sup@v3.4 --reference reference.mmi /data/reads > basecalls.bam
 ```
+
+Bonito will download and cache the basecalling model automatically on first use but all models can be downloaded with -
+
+``` bash
+$ bonito download --models --show  # show all available models
+$ bonito download --models         # download all available models
+```
+
+The default `ont-bonito` package is built against CUDA 10.2 however CUDA 11.1 and 11.3 builds are available.
+
+```bash
+$ pip install -f https://download.pytorch.org/whl/torch_stable.html ont-bonito-cuda111
+```
+
+To optimize inference on CPU with Intel OpenVINO use `--use_openvino` flag:
+
+```bash
+$ bonito basecaller dna_r9.4.1 --reference reference.mmi --use_openvino --device=cpu /data/reads > basecalls.sam
+```
+
+## Modified Bases
+
+Modified base calling is handled by [Remora](https://github.com/nanoporetech/remora).
+
+```bash
+$ bonito basecaller dna_r10.4_e8.1_sup@v3.4 /data/reads --modified-bases 5mC --reference ref.mmi > basecalls_with_mods.bam
+```
+
+See available modified base models with the ``remora model list_pretrained`` command.
+
+## Training your own model
+
+To train a model using your own reads, first basecall the reads with the additional `--save-ctc` flag and use the output directory as the input directory for training.
+
+```bash
+$ bonito basecaller dna_r9.4.1 --save-ctc --reference reference.mmi /data/reads > /data/training/ctc-data/basecalls.sam
+$ bonito train --directory /data/training/ctc-data /data/training/model-dir
+```
+
+In addition to training a new model from scratch you can also easily fine tune one of the pretrained models.
+
+```bash
+bonito train --epochs 1 --lr 5e-4 --pretrained dna_r10.4_e8.1_sup@v3.4 --directory /data/training/ctc-data /data/training/fine-tuned-model
+```
+
+If you are interested in method development and don't have you own set of reads then a pre-prepared set is provide.
+
+```bash
+$ bonito download --training
+$ bonito train /data/training/model-dir
+```
+
+All training calls use Automatic Mixed Precision to speed up training. To disable this, set the `--no-amp` flag to True.
 
 ## Developer Quickstart
 
@@ -25,74 +85,27 @@ $ source venv3/bin/activate
 (venv3) $ pip install --upgrade pip
 (venv3) $ pip install -r requirements.txt
 (venv3) $ python setup.py develop
-(venv3) $ bonito download --models --latest
 ```
 
-## Models
-
-The following pretrained models are available to download with `bonito download`.
-
-| Model | Type | Bonito Version  | 
-| ------ | ------ |------ |
-| `dna_r9.4.1@v3.3`, `dna_r10.3@v3.3`  | CRF-CTC RNN _(fixed blank score)_ | v0.3.7 |
-| `dna_r9.4.1@v3.2`, `dna_r10.3@v3.2`  | CRF-CTC RNN | v0.3.6 |
-| `dna_r10.3@v3` | CRF-CTC RNN  | v0.3.2 |
-| `dna_r9.4.1@v3.1`  | CRF-CTC RNN  | v0.3.1 |
-| `dna_r9.4.1@v3`  | CRF-CTC RNN  | v0.3.0 |
-| `dna_r9.4.1@v2` | CTC CNN _(Custom QuartzNet)_ | v0.2.0 | 
-| `dna_r9.4.1@v1` | CTC CNN _(5x5 QuartzNet)_ | v0.1.2 |
-
-All models can be downloaded with `bonito download --models` or if you just want the latest version then `bonito download --models --latest -f`.
-
-## Training your own model
-
-To train a model using your own reads, first basecall the reads with the additional `--save-ctc` flag and use the output directory as the input directory for training.
-
+To build with OpenVINO backend:
 ```bash
-$ bonito basecaller dna_r9.4.1 --save-ctc --reference reference.mmi /data/reads > /data/training/ctc-data/basecalls.sam
-$ bonito train --directory /data/training/ctc-data /data/training/model-dir
+(venv3) $ pip install develop .[openvino]
 ```
-
-In addition to training a new model from scratch you can also easily fine tune one of the pretrained models.  
-
-```bash
-bonito training --epochs 1 --lr 5e-4 --pretrained dna_r9.4.1@v3.3 --directory /data/training/ctc-data /data/training/fine-tuned-model
-```
-
-If you are interested in method development and don't have you own set of reads then a pre-prepared set is provide.
-
-```bash
-$ bonito download --training
-$ bonito train /data/training/model-dir
-```
-
-All training calls use Automatic Mixed Precision to speed up training. To disable this, set the `--no-amp` flag to True. 
-
-## Pair Decoding
-
-Pair decoding takes a template and complement read to produce higher quaility calls.
-
-```bash
-$ bonito pair pairs.csv /data/reads > basecalls.fasta
-```
-
-The `pairs.csv` file is expected to contain pairs of read ids per line *(seperated by a single space)*.
 
 ## Interface
 
  - `bonito view` - view a model architecture for a given `.toml` file and the number of parameters in the network.
  - `bonito train` - train a bonito model.
- - `bonito convert` - convert a hdf5 training file into a bonito format.
  - `bonito evaluate` - evaluate a model performance.
  - `bonito download` - download pretrained models and training datasets.
- - `bonito basecaller` - basecaller *(`.fast5` -> `.fasta`)*.
+ - `bonito basecaller` - basecaller *(`.fast5` -> `.bam`)*.
 
 ### References
 
  - [Sequence Modeling With CTC](https://distill.pub/2017/ctc/)
  - [Quartznet: Deep Automatic Speech Recognition With 1D Time-Channel Separable Convolutions](https://arxiv.org/pdf/1910.10261.pdf)
  - [Pair consensus decoding improves accuracy of neural network basecallers for nanopore sequencing](https://www.biorxiv.org/content/10.1101/2020.02.25.956771v1.full.pdf)
- 
+
 ### Licence and Copyright
 (c) 2019 Oxford Nanopore Technologies Ltd.
 

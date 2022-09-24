@@ -5,14 +5,13 @@ Bonito basecall
 import torch
 import numpy as np
 from functools import partial
-from bonito.fast5 import ReadChunk
-from bonito.aligner import align_map
-from bonito.multiprocessing import process_map, thread_map
-from bonito.util import mean_qscore_from_qstring, half_supported
-from bonito.util import chunk, stitch, batchify, unbatchify, permute, concat
+
+from bonito.multiprocessing import process_map
+from bonito.util import mean_qscore_from_qstring
+from bonito.util import chunk, stitch, batchify, unbatchify, permute
 
 
-def basecall(model, reads, aligner=None, beamsize=5, chunksize=0, overlap=0, batchsize=1, qscores=False):
+def basecall(model, reads, beamsize=5, chunksize=0, overlap=0, batchsize=1, qscores=False, reverse=None):
     """
     Basecalls a set of reads.
     """
@@ -25,9 +24,8 @@ def basecall(model, reads, aligner=None, beamsize=5, chunksize=0, overlap=0, bat
     scores = (
         (read, {'scores': stitch(v, chunksize, overlap, len(read.signal), model.stride)}) for read, v in scores
     )
-    decoder = partial(decode, decode=model.decode, beamsize=beamsize, qscores=qscores)
+    decoder = partial(decode, decode=model.decode, beamsize=beamsize, qscores=qscores, stride=model.stride)
     basecalls = process_map(decoder, scores, n_proc=4)
-    if aligner: return align_map(aligner, basecalls)
     return basecalls
 
 
@@ -37,12 +35,13 @@ def compute_scores(model, batch):
     """
     with torch.no_grad():
         device = next(model.parameters()).device
-        chunks = batch.to(torch.half).to(device)
+        chunks = batch.to(torch.half) if device != torch.device('cpu') and half_supported() else batch
+        chunks = chunks.to(device)
         probs = permute(model(chunks), 'TNC', 'NTC')
     return probs.cpu().to(torch.float32)
 
 
-def decode(scores, decode, beamsize=5, qscores=False):
+def decode(scores, decode, beamsize=5, qscores=False, stride=1):
     """
     Convert the network scores into a sequence.
     """
@@ -59,4 +58,5 @@ def decode(scores, decode, beamsize=5, qscores=False):
             qstring = '*'
         except:
             pass
-    return {'sequence': seq, 'qstring': qstring, 'mean_qscore': mean_qscore, 'path': path}
+
+    return {'sequence': seq, 'qstring': qstring, 'stride': stride, 'moves': path}

@@ -31,6 +31,15 @@ class Serial(torch.nn.Sequential):
     def __init__(self, sublayers):
         super().__init__(*sublayers)
 
+    def forward(self, x, return_features=False):
+        if return_features:
+            fmaps = []
+            for layer in self:
+                x = layer(x)
+                fmaps.append(x)
+            return x, fmaps
+        return super().forward(x)
+
     def to_dict(self, include_weights=False):
         return {
             'sublayers': [to_dict(layer, include_weights) for layer in self._modules.values()]
@@ -87,15 +96,16 @@ class Convolution(Module):
 @register
 class LinearCRFEncoder(Module):
 
-    def __init__(self, insize, n_base, state_len, bias=True, scale=None, activation=None, blank_score=None):
+    def __init__(self, insize, n_base, state_len, bias=True, scale=None, activation=None, blank_score=None, expand_blanks=True):
         super().__init__()
+        self.scale = scale
         self.n_base = n_base
         self.state_len = state_len
         self.blank_score = blank_score
+        self.expand_blanks = expand_blanks
         size = (n_base + 1) * n_base**state_len if blank_score is None else n_base**(state_len + 1)
         self.linear = torch.nn.Linear(insize, size, bias=bias)
         self.activation = layers.get(activation, lambda: activation)()
-        self.scale = scale
 
     def forward(self, x):
         scores = self.linear(x)
@@ -103,10 +113,13 @@ class LinearCRFEncoder(Module):
             scores = self.activation(scores)
         if self.scale is not None:
             scores = scores * self.scale
-        if self.blank_score is not None:
+        if self.blank_score is not None and self.expand_blanks:
             T, N, C = scores.shape
-            s = torch.tensor(self.blank_score, device=scores.device, dtype=scores.dtype)
-            scores = torch.cat([s.expand(T, N, C//self.n_base, 1), scores.reshape(T, N, C//self.n_base, self.n_base)], axis=-1).reshape(T, N, -1)
+            scores = torch.nn.functional.pad(
+                scores.view(T, N, -1, self.n_base),
+                (1, 0, 0, 0, 0, 0, 0, 0),
+                value=self.blank_score
+            ).view(T, N, -1)
         return scores
 
     def to_dict(self, include_weights=False):

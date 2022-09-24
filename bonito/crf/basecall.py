@@ -1,130 +1,79 @@
 """
-Bonito CRF basecall
+Bonito CRF basecalling
 """
 
 import torch
 import numpy as np
-from kbeam import beamsearch
-from itertools import groupby
-from functools import partial
-from operator import itemgetter
+from koi.decode import beam_search, to_str
 
-import bonito
-from bonito.io import Writer
-from bonito.fast5 import get_reads
-from bonito.aligner import Aligner, align_map
-from bonito.multiprocessing import thread_map, thread_iter
-from bonito.util import concat, chunk, batchify, unbatchify, half_supported
+from bonito.multiprocessing import thread_iter
+from bonito.util import chunk, stitch, batchify, unbatchify, half_supported
 
 
-def stitch(chunks, chunksize, overlap, length, stride, reverse=False):
+def stitch_results(results, length, size, overlap, stride, reverse=False):
     """
-    Stitch chunks together with a given overlap
+    Stitch results together with a given overlap.
     """
-    if isinstance(chunks, dict):
+    if isinstance(results, dict):
         return {
-            k: stitch(v, chunksize, overlap, length, stride, reverse=reverse)
-            for k, v in chunks.items()
+            k: stitch_results(v, length, size, overlap, stride, reverse=reverse)
+            for k, v in results.items()
         }
-    return bonito.util.stitch(chunks, chunksize, overlap, length, stride, reverse=reverse)
+    return stitch(results, size, overlap, length, stride, reverse=reverse)
 
 
-def compute_scores(model, batch, reverse=False):
+def compute_scores(model, batch, beam_width=32, beam_cut=100.0, scale=1.0, offset=0.0, blank_score=2.0, reverse=False):
     """
     Compute scores for model.
     """
-    with torch.no_grad():
+    with torch.inference_mode():
         device = next(model.parameters()).device
-        dtype = torch.float16 if half_supported() else torch.float32
+        dtype = torch.float16 if device != torch.device('cpu') and half_supported() else torch.float32
         scores = model(batch.to(dtype).to(device))
-        if reverse: scores = model.seqdist.reverse_complement(scores)
-        betas = model.seqdist.backward_scores(scores.to(torch.float32))
-        betas -= (betas.max(2, keepdim=True)[0] - 5.0)
-    return {
-        'scores': scores.transpose(0, 1),
-        'betas': betas.transpose(0, 1),
-    }
-
-
-def quantise_int8(x, scale=127/5):
-    """
-    Quantise scores to int8.
-    """
-    scores = x['scores']
-    scores *= scale
-    scores = torch.round(scores).to(torch.int8).detach()
-    betas = x['betas']
-    betas *= scale
-    betas = torch.round(torch.clamp(betas, -127., 128.)).to(torch.int8).detach()
-    return {'scores': scores, 'betas': betas}
-
-
-def transfer(x):
-    """
-    Device to host transfer using pinned memory.
-    """
-    torch.cuda.synchronize()
-    with torch.cuda.stream(torch.cuda.Stream()):
+        if reverse:
+            scores = model.seqdist.reverse_complement(scores)
+        # beam_search expects scores in FP16 precision
+        sequence, qstring, moves = beam_search(
+            scores.to(torch.float16), beam_width=beam_width, beam_cut=beam_cut,
+            scale=scale, offset=offset, blank_score=blank_score
+        )
         return {
-            k: torch.empty(v.shape, pin_memory=True, dtype=v.dtype).copy_(v).numpy()
-            for k, v in x.items()
+            'moves': moves,
+            'qstring': qstring,
+            'sequence': sequence,
         }
 
 
-def decode_int8(scores, seqdist, scale=127/5, beamsize=40, beamcut=100.0):
-    """
-    Beamsearch decode.
-    """
-    path, _ = beamsearch(
-        scores['scores'], scale, seqdist.n_base, beamsize,
-        guide=scores['betas'], beam_cut=beamcut
-    )
-    try:
-        return seqdist.path_to_str(path % 4 + 1)
-    except IndexError:
-        return ""
+def fmt(stride, attrs):
+    return {
+        'stride': stride,
+        'moves': attrs['moves'].numpy(),
+        'qstring': to_str(attrs['qstring']),
+        'sequence': to_str(attrs['sequence']),
+    }
 
 
-def split_read(read, split_read_length=400000):
-    """
-    Split large reads into manageable pieces.
-    """
-    if len(read.signal) <= split_read_length:
-        return [(read, 0, len(read.signal))]
-    breaks = np.arange(0, len(read.signal)+split_read_length, split_read_length)
-    return [(read, start, min(end, len(read.signal))) for (start, end) in zip(breaks[:-1], breaks[1:])]
-
-
-def basecall(model, reads, aligner=None, beamsize=40, chunksize=4000, overlap=500, batchsize=32, qscores=False, reverse=False):
+def basecall(model, reads, chunksize=4000, overlap=100, batchsize=32, reverse=False):
     """
     Basecalls a set of reads.
     """
-    _decode = partial(decode_int8, seqdist=model.seqdist, beamsize=beamsize)
-    reads = (read_chunk for read in reads for read_chunk in split_read(read)[::-1 if reverse else 1])
-    chunks = (
-        ((read, start, end), chunk(torch.from_numpy(read.signal[start:end]), chunksize, overlap))
-        for (read, start, end) in reads
-    )
-    batches = (
-        (k, quantise_int8(compute_scores(model, batch, reverse=reverse)))
-        for k, batch in thread_iter(batchify(chunks, batchsize=batchsize))
-    )
-    stitched = (
-        (read, stitch(x, chunksize, overlap, end - start, model.stride, reverse=reverse))
-        for ((read, start, end), x) in unbatchify(batches)
+    chunks = thread_iter(
+        ((read, 0, len(read.signal)), chunk(torch.from_numpy(read.signal), chunksize, overlap))
+        for read in reads
     )
 
-    transferred = thread_map(transfer, stitched, n_thread=1)
-    basecalls = thread_map(_decode, transferred, n_thread=8)
+    batches = thread_iter(batchify(chunks, batchsize=batchsize))
 
-    basecalls = (
-        (read, ''.join(seq for k, seq in parts))
-        for read, parts in groupby(basecalls, lambda x: (x[0].parent if hasattr(x[0], 'parent') else x[0]))
-    )
-    basecalls = (
-        (read, {'sequence': seq, 'qstring': '?' * len(seq) if qscores else '*', 'mean_qscore': 0.0})
-        for read, seq in basecalls
+    scores = thread_iter(
+        (read, compute_scores(model, batch, reverse=reverse)) for read, batch in batches
     )
 
-    if aligner: return align_map(aligner, basecalls)
-    return basecalls
+    results = thread_iter(
+        (read, stitch_results(scores, end - start, chunksize, overlap, model.stride, reverse))
+        for ((read, start, end), scores) in unbatchify(scores)
+    )
+
+    return thread_iter(
+        (read, fmt(model.stride, attrs))
+        for read, attrs in results
+    )

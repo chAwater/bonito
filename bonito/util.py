@@ -11,12 +11,15 @@ from itertools import groupby
 from operator import itemgetter
 from importlib import import_module
 from collections import deque, defaultdict, OrderedDict
+from torch.utils.data import DataLoader
 
 import toml
 import torch
+import koi.lstm
 import parasail
 import numpy as np
 from torch.cuda import get_device_capability
+from bonito.openvino.model import load_openvino_model
 
 try:
     from claragenomics.bindings import cuda
@@ -35,7 +38,7 @@ default_data = os.path.join(__data__, "dna_r9.4.1")
 default_config = os.path.join(__configs__, "dna_r9.4.1@v3.1.toml")
 
 
-def init(seed, device):
+def init(seed, device, deterministic=True):
     """
     Initialise random libs and setup cudnn
 
@@ -44,10 +47,10 @@ def init(seed, device):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if device == "cpu": return
+    if not device.startswith('cuda'): return
     torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = (not deterministic)
     assert(torch.cuda.is_available())
 
 
@@ -124,8 +127,8 @@ def mean_qscore_from_qstring(qstring):
     Convert qstring into a mean qscore
     """
     if len(qstring) == 0: return 0.0
-    err_probs = [10**((ord(c) - 33) / -10) for c in qstring]
-    mean_err = np.mean(err_probs)
+    qs = (np.array(qstring, 'c').view(np.uint8) - 33)
+    mean_err = np.exp(qs * (-np.log(10) / 10.)).mean()
     return -10 * np.log10(max(mean_err, 1e-4))
 
 
@@ -223,34 +226,6 @@ def unbatchify(batches, dim=0):
     )
 
 
-def load_data(limit=None, directory=None):
-    """
-    Load the training data
-    """
-    if directory is None:
-        directory = default_data
-
-    chunks = np.load(os.path.join(directory, "chunks.npy"), mmap_mode='r')
-    targets = np.load(os.path.join(directory, "references.npy"), mmap_mode='r')
-    lengths = np.load(os.path.join(directory, "reference_lengths.npy"), mmap_mode='r')
-
-    indices = os.path.join(directory, "indices.npy")
-    
-    if os.path.exists(indices):
-        idx = np.load(indices, mmap_mode='r')
-        idx = idx[idx < lengths.shape[0]]
-        if limit:
-            idx = idx[:limit]
-        return chunks[idx, :], targets[idx, :], lengths[idx]
-
-    if limit:
-        chunks = chunks[:limit]
-        targets = targets[:limit]
-        lengths = lengths[:limit]
-
-    return np.array(chunks), np.array(targets), np.array(lengths)
-
-
 def load_symbol(config, symbol):
     """
     Dynamic load a symbol from module specified in model config.
@@ -277,7 +252,7 @@ def match_names(state_dict, model):
     return OrderedDict([(k, remap[k]) for k in state_dict.keys()])
 
 
-def load_model(dirname, device, weights=None, half=None, chunksize=0):
+def load_model(dirname, device, weights=None, half=None, chunksize=None, batchsize=None, overlap=None, quantize=False, use_koi=False, use_openvino=False):
     """
     Load a model from disk
     """
@@ -290,14 +265,29 @@ def load_model(dirname, device, weights=None, half=None, chunksize=0):
             raise FileNotFoundError("no model weights found in '%s'" % dirname)
         weights = max([int(re.sub(".*_([0-9]+).tar", "\\1", w)) for w in weight_files])
 
-    device = torch.device(device)
+    if not use_openvino:
+        device = torch.device(device)
     config = toml.load(os.path.join(dirname, 'config.toml'))
     weights = os.path.join(dirname, 'weights_%s.tar' % weights)
+
+    basecall_params = config.get("basecaller", {})
+    # use `value or dict.get(key)` rather than `dict.get(key, value)` to make
+    # flags override values in config
+    chunksize = basecall_params["chunksize"] = chunksize or basecall_params.get("chunksize", 4000)
+    overlap = basecall_params["overlap"] = overlap or basecall_params.get("overlap", 500)
+    batchsize = basecall_params["batchsize"] = batchsize or basecall_params.get("batchsize", 64)
+    quantize = basecall_params["quantize"] = basecall_params.get("quantize") if quantize is None else quantize
+    config["basecaller"] = basecall_params
 
     Model = load_symbol(config, "Model")
     model = Model(config)
 
-    state_dict = torch.load(weights, map_location=device)
+    if config["model"]["package"] == "bonito.crf" and use_koi and device != 'cpu':
+        model.encoder = koi.lstm.update_graph(
+            model.encoder, batchsize=batchsize, chunksize=chunksize // model.stride, quantize=quantize
+        )
+
+    state_dict = torch.load(weights, map_location=device if not use_openvino else 'cpu')
     state_dict = {k2: state_dict[k1] for k1, k2 in match_names(state_dict, model).items()}
     new_state_dict = OrderedDict()
     for k, v in state_dict.items():
@@ -306,7 +296,10 @@ def load_model(dirname, device, weights=None, half=None, chunksize=0):
 
     model.load_state_dict(new_state_dict)
 
-    if half is None:
+    if use_openvino:
+        model = load_openvino_model(model, dirname)
+
+    if half is None and device != 'cpu':
         half = half_supported()
 
     if half: model = model.half()
@@ -354,13 +347,14 @@ def accuracy(ref, seq, balanced=False, min_coverage=0.0):
     """
     alignment = parasail.sw_trace_striped_32(seq, ref, 8, 4, parasail.dnafull)
     counts = defaultdict(int)
-    _, cigar = parasail_to_sam(alignment, seq)
 
     q_coverage = len(alignment.traceback.query) / len(seq)
     r_coverage = len(alignment.traceback.ref) / len(ref)
 
     if r_coverage < min_coverage:
         return 0.0
+
+    _, cigar = parasail_to_sam(alignment, seq)
 
     for count, op  in re.findall(split_cigar, cigar):
         counts[op] += int(count)
