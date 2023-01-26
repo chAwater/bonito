@@ -265,7 +265,7 @@ def set_config_defaults(config, chunksize=None, batchsize=None, overlap=None, qu
     # use `value or dict.get(key)` rather than `dict.get(key, value)` to make
     # flags override values in config
     basecall_params["chunksize"] = chunksize or basecall_params.get("chunksize", 4000)
-    basecall_params["overlap"] = overlap or basecall_params.get("overlap", 500)
+    basecall_params["overlap"] = overlap if overlap is not None else basecall_params.get("overlap", 500)
     basecall_params["batchsize"] = batchsize or basecall_params.get("batchsize", 64)
     basecall_params["quantize"] = basecall_params.get("quantize") if quantize is None else quantize
     config["basecaller"] = basecall_params
@@ -289,11 +289,14 @@ def _load_model(model_file, config, device, half=None, use_koi=False):
     Model = load_symbol(config, "Model")
     model = Model(config)
 
-    if config["model"]["package"] == "bonito.crf" and use_koi:
-        model.encoder = koi.lstm.update_graph(
-            model.encoder,
+    config["basecaller"]["chunksize"] -= config["basecaller"]["chunksize"] % model.stride
+    # overlap must be even multiple of stride for correct stitching
+    config["basecaller"]["overlap"] -= config["basecaller"]["overlap"] % (model.stride * 2)
+
+    if use_koi:
+        model.use_koi(
             batchsize=config["basecaller"]["batchsize"],
-            chunksize=config["basecaller"]["chunksize"] // model.stride,
+            chunksize=config["basecaller"]["chunksize"],
             quantize=config["basecaller"]["quantize"],
         )
 
